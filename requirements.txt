@@ -1,0 +1,5 @@
+aiohttp==1.0.5
+click==6.6
+ipython==5.1.0
+lxml==3.6.4
+requests==2.11.1
