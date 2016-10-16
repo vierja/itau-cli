@@ -22,6 +22,8 @@ class ItauClient:
     MAIN_URL = ITAU_DOMAIN + '/trx/home'
     HISTORY_ACCOUNT_URL = ITAU_DOMAIN + '/trx/cuentas/{type}/{hash}/{month}/{year}/consultaHistorica'
     CURRENT_ACCOUNT_URL = ITAU_DOMAIN + '/trx/cuentas/{type}/{hash}/mesActual'
+    CREDIT_CARD_URL = ITAU_DOMAIN + '/trx/tarjetas/credito'
+    CREDIT_CARD_MOV_URL = ITAU_DOMAIN + '/trx/tarjetas/credito/{}/movimientos_actuales/{}'
 
     ACCOUNT_TYPES = {
         'savings_account': 'caja_de_ahorro',
@@ -44,7 +46,7 @@ class ItauClient:
     def __init__(self, username, password):
         self.username = username
         self.password = password
-        self.cookies = self.login()
+        self.login()
 
     def parse_accounts(self, accounts):
         accounts_json = accounts['cuentas']
@@ -64,6 +66,34 @@ class ItauClient:
                     'original': account_json,
                 }
                 self.accounts.append(cleaned_account)
+
+    def parse_date(self, date_json):
+        return datetime.date(
+            date_json['year'],
+            date_json['monthOfYear'],
+            date_json['dayOfMonth']
+        )
+
+    def parse_credit_cards(self, ccs_json):
+        ccs_json = ccs_json['itaulink_msg']['data'][
+            'objetosTarjetaCredito']['tarjetaImagen']
+
+        self.credit_cards = []
+        for cc_json, image in ccs_json:
+            cleaned_cc = {
+                'brand': cc_json['sello'],
+                'number': (
+                    cc_json['nroTarjetaTitular'][:4] + 'X' * 8 +
+                    cc_json['nroTarjetaTitular'][-4:]
+                ),
+                'expiration_date': self.parse_date(
+                    cc_json['fechaVencimiento']),
+                'name': cc_json['nombreTitular'],
+                'id': cc_json['id'],
+                'hash': cc_json['hash'],
+            }
+
+            self.credit_cards.append(cleaned_cc)
 
     def parse_transaction(self, raw_tx):
         if raw_tx['tipo'] == 'D':
@@ -85,11 +115,7 @@ class ItauClient:
             'type': transaction_type,
             'amount': raw_tx['importe'],
             'balance': raw_tx['saldo'],
-            'date': datetime.date(
-                raw_tx['fecha']['year'],
-                raw_tx['fecha']['monthOfYear'],
-                raw_tx['fecha']['dayOfMonth']
-            ),
+            'date': self.parse_date(raw_tx['fecha']),
             'meta': {}
         }
 
@@ -135,6 +161,107 @@ class ItauClient:
                 transactions.append(tx)
 
         return transactions
+
+    def parse_cc_movements(self, cc_mov_json):
+        movements = []
+        json_movs = cc_mov_json['itaulink_msg']['data'][
+            'datosMovs']['movimientos']
+        for json_mov in json_movs:
+            if json_mov['moneda'].lower() in ['Dolares', 'dolares']:
+                currency_id = 'USD'
+            elif json_mov['moneda'].lower() == 'pesos':
+                currency_id = 'UYU'
+            else:
+                logger.warning('Unknown currency {} from {}'.format(
+                    json_mov['moneda'], json_mov))
+                continue
+
+            mov = {
+                'type': json_mov['tipo'].lower().strip(),
+                'description': ' '.join(json_mov['nombreComercio'].split()),
+                'date': self.parse_date(json_mov['fecha']),
+                'amount': json_mov['importe'],
+                'currency': currency_id,
+                'coupon_id': json_mov['idCupon'],
+                'meta': {},
+            }
+
+            if mov['type'] == 'recibo de pago':
+                continue
+
+            if mov['amount'] < 0:
+                mov['type'] = 'credit'
+                mov['amount'] *= -1
+            else:
+                mov['type'] = 'debit'
+
+            if (mov['description'].startswith('REDUC. IVA LEY') or
+                mov['description'].startswith('DEVOLUCION DE IVA LEY')):
+                mov['meta']['tax_return'] = True
+
+            if mov['description'].startswith('COSTO DE TARJETA'):
+                mov['meta']['bank_costs'] = True
+
+            if mov['description'].startswith('SEGURO DE VIDA SOBRE SALDO'):
+                mov['meta']['life_insurance'] = True
+
+            movements.append(mov)
+
+        return movements
+
+    def get_credit_cards(self):
+        r = requests.post(self.CREDIT_CARD_URL, cookies=self.cookies)
+        credit_cards_json = r.json()
+        self.parse_credit_cards(credit_cards_json)
+
+        logger.debug('Found {} credit cards.'.format(len(self.credit_cards)))
+
+        for cc in self.credit_cards:
+            from_date = datetime.date(2012, 5, 1)
+
+            today = datetime.date.today()
+            movements = []
+
+            tasks = []
+            while today > from_date:
+                tasks.append(self.get_month_credit_card(cc, today))
+                today -= relativedelta(months=1)
+
+            loop = asyncio.get_event_loop()
+            monthly_movements = loop.run_until_complete(asyncio.gather(*tasks))
+
+            for month_movements in monthly_movements:
+                movements.extend(month_movements)
+
+            by_currency_id = {}
+            for mov in sorted(movements, key=lambda x: x['date']):
+                by_currency_id.setdefault(mov['currency'], []).append(mov)
+
+            cc['movements'] = by_currency_id
+
+    async def get_month_credit_card(self, cc, month_date):
+        today = datetime.date.today()
+        if month_date.month == today.month and month_date.year == today.year:
+            url_code = '00000000'
+        else:
+            url_code = month_date.strftime('%Y%m01')
+
+        logger.debug('Fetching month={}-{} for {}'.format(
+            month_date.year, month_date.month, cc['number']
+        ))
+
+        url = self.CREDIT_CARD_MOV_URL.format(cc['hash'], url_code)
+
+        try:
+            cookies = dict(self.cookies)
+            async with aiohttp.ClientSession(cookies=cookies) as session:
+                async with session.post(url) as r:
+                    movements_json = await r.json()
+                    return self.parse_cc_movements(movements_json)
+        except Exception as e:
+            logger.debug('Error fetching {}. {}, Ignoring'.format(
+                month_date.isoformat()[:10], e))
+            return []
 
     async def get_month_account_details(self, account, month_date):
         today = datetime.date.today()
@@ -227,6 +354,36 @@ class ItauClient:
                         tx['meta'].get('tax_return')
                     ])
 
+        for cc in self.credit_cards:
+            for currency, movements in cc['movements'].items():
+                filename = '{}-{}-{}.csv'.format(
+                    cc['brand'], currency, cc['number'])
+                with open(filename, 'w') as f:
+                    writer = csv.writer(f, delimiter='\t')
+                    writer.writerow([
+                        'coupon', 'currency', 'date', 'description',
+                        'type', 'debit', 'credit', 'tax return', 'bank costs',
+                        'life insurance',
+                    ])
+
+                    for mov in movements:
+                        debit = ''
+                        credit = ''
+                        amount = '{:.2f}'.format(mov['amount'])
+                        if mov['type'] == 'debit':
+                            debit = amount
+                        elif mov['type'] == 'credit':
+                            credit = amount
+
+                        writer.writerow([
+                            mov['coupon_id'], mov['currency'],
+                            mov['date'].isoformat(), mov['description'],
+                            mov['type'], debit, credit,
+                            mov['meta'].get('tax_return'),
+                            mov['meta'].get('bank_costs'),
+                            mov['meta'].get('life_insurance'),
+                        ])
+
     def login(self):
         r = requests.post(self.LOGIN_URL, data={
             'segmento': 'panelPersona',
@@ -254,6 +411,7 @@ class ItauClient:
             ).group(1))
 
         self.parse_accounts(accounts)
+        self.get_credit_cards()
 
         logger.info('{} accounts found.'.format(len(self.accounts)))
         for account in self.accounts:
